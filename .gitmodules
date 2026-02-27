@@ -1,0 +1,6 @@
+[submodule "3DTeethSeg_Challenge/vendor/TSegFormer"]
+	path = 3DTeethSeg_Challenge/vendor/TSegFormer
+	url = https://github.com/huiminxiong/TSegFormer.git
+[submodule "3DTeethSeg_Challenge/vendor/3DTeethSeg_MICCAI_Challenges"]
+	path = 3DTeethSeg_Challenge/vendor/3DTeethSeg_MICCAI_Challenges
+	url = https://github.com/abenhamadou/3DTeethSeg_MICCAI_Challenges.git
