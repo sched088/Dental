@@ -11,7 +11,7 @@ Input format (3DTeethSeg):
 
 Output format (TSegFormer):
   - JSON files: {"feature": [[...], ...], "label": [...], "category": [...]}
-    - feature: Nx8 array (XYZ + normals + mean_curvature + avg_angle_curvature)
+    - feature: Nx8 array (XYZ + normals + gaussian_curvature + novel_curvature_mi)
     - label: N integers (0-32, where 0 = gingiva, 1-16 per jaw type)
     - category: [1,0] for mandible / [0,1] for maxillary
 
@@ -29,6 +29,7 @@ import os
 import glob
 import numpy as np
 import trimesh
+from scipy.sparse import csr_matrix
 from pathlib import Path
 
 
@@ -61,53 +62,123 @@ def is_mandible(fdi_labels):
     return median_label >= 30
 
 
-def compute_vertex_curvatures(mesh):
+def _compute_gaussian_curvature(mesh):
     """
-    Compute per-vertex curvature estimates from a trimesh mesh.
+    Discrete Gaussian curvature via the angle defect formula.
+
+    K(v) = 2π - Σ(interior triangle angles at v)
 
     Returns:
-        mean_curvature: (N,) mean curvature per vertex
-        avg_angle_curvature: (N,) average dihedral angle deviation per vertex
-            (the feature TSegFormer uses for geometry-guided loss)
+        gaussian_curvature: (N,) float32 per-vertex Gaussian curvature
     """
     n_verts = len(mesh.vertices)
+    faces = mesh.faces  # (F, 3) vertex indices
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
 
-    # Mean curvature via discrete Laplace-Beltrami
-    # trimesh doesn't have a direct mean curvature function,
-    # so we approximate using the face adjacency angles.
-    mean_curvature = np.zeros(n_verts, dtype=np.float32)
-    avg_angle_curvature = np.zeros(n_verts, dtype=np.float32)
+    # Accumulate interior angles at each vertex across all faces
+    angle_sum = np.zeros(n_verts, dtype=np.float64)
 
-    if hasattr(mesh, 'face_adjacency_angles') and len(mesh.face_adjacency_angles) > 0:
-        # face_adjacency_angles: angle between adjacent face normals (dihedral angle)
-        # face_adjacency: pairs of adjacent face indices
-        angles = mesh.face_adjacency_angles  # (M,) in radians
-        adj_faces = mesh.face_adjacency  # (M, 2) face index pairs
+    if len(faces) > 0:
+        # For each face corner, compute the interior angle
+        # Corner 0: angle at faces[:,0] between edges (v1-v0) and (v2-v0)
+        # Corner 1: angle at faces[:,1] between edges (v0-v1) and (v2-v1)
+        # Corner 2: angle at faces[:,2] between edges (v0-v2) and (v1-v2)
+        for corner in range(3):
+            i0 = faces[:, corner]
+            i1 = faces[:, (corner + 1) % 3]
+            i2 = faces[:, (corner + 2) % 3]
 
-        # For each edge between adjacent faces, attribute the dihedral angle
-        # to the shared vertices
-        vertex_angle_sum = np.zeros(n_verts, dtype=np.float64)
-        vertex_angle_count = np.zeros(n_verts, dtype=np.int32)
+            e1 = verts[i1] - verts[i0]  # (F, 3)
+            e2 = verts[i2] - verts[i0]  # (F, 3)
 
-        for idx, (f1, f2) in enumerate(adj_faces):
-            angle = angles[idx]
-            # Find shared vertices between the two faces
-            shared = np.intersect1d(mesh.faces[f1], mesh.faces[f2])
-            for v in shared:
-                vertex_angle_sum[v] += angle
-                vertex_angle_count[v] += 1
+            # Normalize edge vectors (clip length to avoid division by zero)
+            len1 = np.linalg.norm(e1, axis=1, keepdims=True)
+            len2 = np.linalg.norm(e2, axis=1, keepdims=True)
+            len1 = np.maximum(len1, 1e-12)
+            len2 = np.maximum(len2, 1e-12)
 
-        mask = vertex_angle_count > 0
-        avg_angle_curvature[mask] = (
-            vertex_angle_sum[mask] / vertex_angle_count[mask]
-        ).astype(np.float32)
+            e1_norm = e1 / len1
+            e2_norm = e2 / len2
 
-        # Mean curvature approximation: deviation from pi (flat surface)
-        mean_curvature[mask] = (
-            np.abs(vertex_angle_sum[mask] / vertex_angle_count[mask] - np.pi)
-        ).astype(np.float32)
+            # Interior angle = arccos(dot product of normalized edges)
+            dot = np.sum(e1_norm * e2_norm, axis=1)
+            dot = np.clip(dot, -1.0, 1.0)
+            angles = np.arccos(dot)  # (F,)
 
-    return mean_curvature, avg_angle_curvature
+            np.add.at(angle_sum, i0, angles)
+
+    gaussian_curvature = (2.0 * np.pi - angle_sum).astype(np.float32)
+    return gaussian_curvature
+
+
+def _compute_novel_curvature(mesh):
+    """
+    Novel point curvature m_i from TSegFormer (arXiv:2311.13234, Section 2.2).
+
+    m_i = (1 / |K(i)|) · Σ_{j ∈ K(i)} θ(n_i, n_j)
+
+    where K(i) is the 2-ring neighborhood and θ is the angle between
+    vertex normals.
+
+    Returns:
+        novel_curvature: (N,) float32 per-vertex novel curvature
+    """
+    n_verts = len(mesh.vertices)
+    normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+
+    # Build sparse adjacency matrix from unique edges
+    edges = mesh.edges_unique  # (E, 2)
+    n_edges = len(edges)
+
+    if n_edges == 0:
+        return np.zeros(n_verts, dtype=np.float32)
+
+    # Symmetric adjacency: add both directions
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    data = np.ones(2 * n_edges, dtype=np.float32)
+    A = csr_matrix((data, (rows, cols)), shape=(n_verts, n_verts))
+
+    # 2-ring neighborhood: K = A + A² (1-ring union 2-ring)
+    K = A + A.dot(A)
+    K.setdiag(0)       # exclude self from neighborhood
+    K.eliminate_zeros()
+
+    # Extract all (i, j) neighbor pairs from sparse COO
+    K_coo = K.tocoo()
+    src = K_coo.row   # vertex i indices
+    dst = K_coo.col   # vertex j indices (neighbors)
+
+    # Compute θ(n_i, n_j) = arccos(n_i · n_j) for all pairs
+    dot = np.sum(normals[src] * normals[dst], axis=1)
+    dot = np.clip(dot, -1.0, 1.0)
+    theta = np.arccos(dot)
+
+    # Sum angles and count neighbors per vertex
+    angle_sum = np.zeros(n_verts, dtype=np.float64)
+    neighbor_count = np.zeros(n_verts, dtype=np.int64)
+    np.add.at(angle_sum, src, theta)
+    np.add.at(neighbor_count, src, 1)
+
+    # m_i = angle_sum / neighbor_count (0 for isolated vertices)
+    mask = neighbor_count > 0
+    novel_curvature = np.zeros(n_verts, dtype=np.float64)
+    novel_curvature[mask] = angle_sum[mask] / neighbor_count[mask]
+
+    return novel_curvature.astype(np.float32)
+
+
+def compute_vertex_curvatures(mesh):
+    """
+    Compute per-vertex curvature features matching TSegFormer paper (Section 2.2).
+
+    Returns:
+        gaussian_curvature: (N,) discrete Gaussian curvature K(v)
+        novel_curvature_mi: (N,) novel point curvature m_i
+    """
+    gaussian_curvature = _compute_gaussian_curvature(mesh)
+    novel_curvature_mi = _compute_novel_curvature(mesh)
+    return gaussian_curvature, novel_curvature_mi
 
 
 def process_scan(obj_path, json_path, output_dir, sample_name):
@@ -163,14 +234,22 @@ def process_scan(obj_path, json_path, output_dir, sample_name):
         normals = np.zeros((n_verts, 3), dtype=np.float32)
 
     # Compute curvatures
-    mean_curvature, avg_angle_curvature = compute_vertex_curvatures(mesh)
+    gaussian_curvature, novel_curvature_mi = compute_vertex_curvatures(mesh)
 
-    # Build 8D feature vector: [x, y, z, nx, ny, nz, mean_curv, avg_angle_curv]
+    # Normalize XYZ to zero-mean and unit-scale (TSegFormer's sample_and_group
+    # uses fixed radii like 0.15, 0.2 that assume normalized coordinates)
+    centroid = vertices.mean(axis=0)
+    vertices = vertices - centroid
+    scale = np.max(np.linalg.norm(vertices, axis=1))
+    if scale > 0:
+        vertices = vertices / scale
+
+    # Build 8D feature vector: [x, y, z, nx, ny, nz, K(v), m_i]
     features = np.column_stack([
-        vertices,           # (N, 3) XYZ
-        normals,            # (N, 3) vertex normals
-        mean_curvature,     # (N, 1) mean curvature
-        avg_angle_curvature # (N, 1) avg dihedral angle curvature
+        vertices,             # (N, 3) XYZ (normalized)
+        normals,              # (N, 3) vertex normals
+        gaussian_curvature,   # (N, 1) discrete Gaussian curvature K(v)
+        novel_curvature_mi    # (N, 1) novel point curvature m_i
     ])
 
     # Write output in TSegFormer format
